@@ -1,0 +1,149 @@
+---
+title: "Cluster CEs related data"
+output: html_notebook
+---
+
+# Init
+```{r}
+library(tidyverse)
+library(magrittr)
+library(readr)
+library(tibble)
+library(factoextra)
+```
+
+# Load data
+Loads the data from the csv files.
+```{r}
+original_data <- read_csv("../data/nicepr_obs.csv")
+
+ce_data <- read_csv("../data/nicepr_eval.csv")
+```
+
+# Data mumbojumbo
+Transform original data to long format and add a type column to differentiate 
+between original and counterfactual data.
+```{r}
+original_data %<>%
+  pivot_longer(cols = starts_with("week"), 
+               names_to = "week",
+               values_to = "value") %>%
+  mutate(week = str_replace(week, "minus", "-"),
+         week = as.numeric(str_remove(week, "week_"))
+        ) %>%
+   mutate(type = "original")
+
+ce_data %<>%
+  pivot_longer(cols = starts_with("week"),
+               names_to = "week",
+               values_to = "value") %>%
+  mutate(week = str_replace(week, "minus", "-"),
+         week = as.numeric(str_remove(week, "week_"))
+        ) %>%
+  mutate(type = "ce") %>%
+  select(id, week, value, type)
+
+final_data <-
+    original_data %>%
+    bind_rows(ce_data)
+```
+
+# Clustering data
+Transform the data into the wide format, compute the features (time series)
+and normalize them.
+```{r}
+# compute the sum of difference clicks by periods between tma_weeks
+normalize <- function(x){
+  return((x - min(x))/(max(x) - min(x) + .Machine$double.xmin))
+}
+
+cluster_data <-
+    final_data %>% 
+    pivot_wider(names_from = type, 
+                values_from = value,
+                values_fn = {mean},
+                values_fill = list(values = 0)) %>%
+    mutate(diff = ce - original,
+           ratio = ce/(original + .Machine$double.xmin),
+           ratio = if_else(abs(ratio) == Inf, 200, ratio)
+           ) %>% 
+    pivot_wider(names_from = week, 
+                names_glue = "week_{str_replace(as.character(week),'-','minus_')}_{.value}",
+                values_from = c(original, ce, diff, ratio),
+                values_fn = {mean},
+                values_fill = list(values = 0)) %>% 
+  rename(id_student = id) %>% 
+  mutate(across(-id_student, ~ normalize(.)))
+```
+
+# Clustering
+At first select number of clusters using the elbow method and silhouette method.
+Then cluster the data using kmeans with k=2. Finally, visualize the clusters and 
+cluster centers.
+
+> NOTE: cluster_data_3 and strange naming conventions are results of the initial experiments
+
+```{r}
+cluster_data3 <-
+  cluster_data %>%
+  select(id_student, contains("diff"), contains("ratio"))
+
+g_wss <- fviz_nbclust(cluster_data3[,-1],kmeans, method = "wss") +
+  geom_vline(xintercept = 2, linetype = 2, size=1.5) + 
+  theme(plot.title = element_blank(),text = element_text(size = 12)) +
+  ylab("WCSS")
+
+g_sil <- fviz_nbclust(cluster_data3[,-1], kmeans, method = "silhouette") +
+  theme(plot.title = element_blank(),text = element_text(size = 12))
+
+g_measures <- g_wss / g_sil
+
+ggsave("../output/cluster_measures.png", g_measures, width = 10, height = 5, dpi = 300)
+
+set.seed(2206)
+kmeans_2_2 <-
+  cluster_data3[,-1] %>% 
+  kmeans(2)
+
+g_clusters <- fviz_cluster(kmeans_2_2, cluster_data3[,-1], stand = FALSE,
+                           geom = "point", main = NULL) +
+  theme_bw() +
+  xlab("Dimension 1 (90.5%)") +
+  ylab("Dimension 2 (3.7%)") +
+  theme(text = element_text(size = 12),
+        legend.text = element_text(size = 12),
+        strip.text.x = element_text(size = 12),
+        legend.position = "bottom",
+        legend.title = element_blank())
+
+ggsave("../output/clusters.png", g_clusters, width = 10, height = 10, dpi = 300)
+
+g_centers <- 
+  kmeans_2_2$centers %>% 
+  as_tibble() %>%
+  mutate(cluster = paste0("cluster ",row_number())) %>% 
+  pivot_longer(cols = -cluster, names_to = "variable", values_to = "value") %>% 
+  mutate(variable = str_replace(variable, "minus_","-"),
+         variable = str_replace(variable, "week_",""),
+         week = purrr::map_dbl(variable,~as.numeric(str_split(., "_",simplify = TRUE)[1,1])),
+         var = purrr::map_chr(variable, ~str_split(., "_",simplify = TRUE)[1,2])) %>% 
+  select(cluster, week, var, value) %>%
+  arrange(cluster, week, var) %>%
+  mutate(Cluster = as.factor(cluster),
+         var = if_else(var == "diff", "Difference in counterfactual and original activity counts", "Ratio between counterfactual and original activity counts")) %>% 
+  ggplot(aes(x = week, y = value, color = Cluster)) +
+  geom_line(alpha = 0.8) +
+  facet_wrap(~var, ncol = 1) + 
+  scale_x_continuous(breaks = seq(-5, 40, by = 5),
+                     expand = c(0,0)) +
+  theme_bw() +
+  xlab("Week") +
+  ylab("Normalized feature value") +
+  theme(text = element_text(size = 12),
+        legend.text = element_text(size = 12),
+        strip.text.x = element_text(size = 12),
+        legend.position = "bottom",
+        legend.title = element_blank())
+
+ggsave("../output/cluster_centers.png",g_centers, width = 10, height = 5, dpi = 300)
+```
